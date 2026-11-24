@@ -1,0 +1,24 @@
+[package]
+name = "adaptif-gatotkaca-runtime"
+description = "Runtime abstraction traits for the adaptif-gatotkaca engine: one stable interface over tokio, thread pools and other executors"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+authors = ["PT Adaptif Sinergi Dinamis"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["runtime", "executor", "async", "abstraction", "tokio"]
+categories = ["asynchronous", "concurrency"]
+exclude = ["/AGENTS.md", "/.gitattributes", "/.gitignore"]
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
