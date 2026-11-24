@@ -1,20 +1,23 @@
 [package]
 name = "adaptif-gatotkaca-runtime"
-description = "Runtime abstraction traits for the adaptif-gatotkaca engine: one stable interface over tokio, thread pools and other executors"
+description = "A uniform facade over execution models for the adaptif-gatotkaca engine: one interface over tokio, thread pools and thread-per-core executors"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 authors = ["PT Adaptif Sinergi Dinamis"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/csatrio/adaptif-gatotkaca-runtime"
+documentation = "https://docs.rs/adaptif-gatotkaca-runtime"
 keywords = ["runtime", "executor", "async", "abstraction", "tokio"]
 categories = ["asynchronous", "concurrency"]
-exclude = ["/AGENTS.md", "/.gitattributes", "/.gitignore"]
+include = ["/src/**/*.rs", "/README.md", "/CHANGELOG.md", "/AGENTS.md", "/LICENSE-*", "/Cargo.toml"]
 
 [dependencies]
 
 [dev-dependencies]
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
