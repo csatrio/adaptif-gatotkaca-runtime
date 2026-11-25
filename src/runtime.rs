@@ -7,6 +7,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use crate::cancellation::GatotkacaCancellationToken;
+use crate::readiness::GatotkacaReadiness;
 use crate::signals::GatotkacaSignals;
 use crate::timers::GatotkacaTimer;
 
@@ -99,6 +100,9 @@ pub trait GatotkacaRuntimeHandle: Clone + Send + Sync + 'static {
     /// The cancellation token this runtime uses.
     type CancellationToken: GatotkacaCancellationToken;
 
+    /// The readiness source this runtime hands out.
+    type Readiness: GatotkacaReadiness;
+
     /// Spawns `future` on the underlying runtime.
     fn spawn<F>(&self, future: F) -> Self::JoinHandle<F::Output>
     where
@@ -124,6 +128,10 @@ pub trait GatotkacaRuntimeHandle: Clone + Send + Sync + 'static {
 
     /// The signal source for this runtime.
     fn signals(&self) -> Self::Signals;
+
+    /// The readiness source for this runtime: registers OS objects (file descriptors on unix, sockets on Windows) with its
+    /// poller. See [`readiness`](crate::readiness) for the contract.
+    fn readiness(&self) -> Self::Readiness;
 
     /// A token cancelled when [`OwnedRuntime::shutdown`] begins, so tasks can flush and exit. Each call returns a child of the
     /// runtime's token, so cancelling it does not affect the runtime.

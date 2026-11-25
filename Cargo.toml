@@ -1,7 +1,7 @@
 [package]
 name = "adaptif-gatotkaca-runtime"
 description = "A uniform facade over execution models for the adaptif-gatotkaca engine: one interface over tokio, thread pools and thread-per-core executors"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 authors = ["PT Adaptif Sinergi Dinamis"]
@@ -16,12 +16,17 @@ include = ["/src/**/*.rs", "/README.md", "/CHANGELOG.md", "/AGENTS.md", "/LICENS
 [dependencies]
 
 [dev-dependencies]
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
+unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"

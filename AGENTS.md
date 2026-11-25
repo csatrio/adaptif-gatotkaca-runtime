@@ -13,7 +13,10 @@ source of truth; this file is the map.
   tokio and tokio-util are dev-dependencies, used to prove the traits fit a real executor.
 - **No `dyn`.** Every trait is generic, with associated types and `impl Future` returns. Calls go straight to the executor. Do
   not add object-safe variants, boxing, or `Box<dyn Future>`.
-- **`std` types only** in public signatures (`Future`, `Duration`, `Instant`, `io::Result`). No executor types.
+- **`std` types only** in public signatures (`Future`, `Duration`, `Instant`, `io::Result`, `RawFd` / `RawSocket`). No
+  executor types.
+- **`unsafe` is documented.** Lints deny `unsafe_op_in_unsafe_fn`, undocumented `unsafe` blocks and `unsafe fn` without a
+  `# Safety` section. Every `unsafe` block carries a `// SAFETY:` comment.
 - **Every public item has a doc comment** (`missing_docs` warns). Docs say what an implementation must guarantee.
 - MSRV 1.89, edition 2024, 140-column rustfmt.
 
@@ -26,6 +29,7 @@ source of truth; this file is the map.
 | `src/timers.rs` | `GatotkacaTimer`, `GatotkacaInterval`, `GatotkacaTimerTask` |
 | `src/cancellation.rs` | `GatotkacaCancellationToken` |
 | `src/signals.rs` | `Signal`, `GatotkacaSignals`, `GatotkacaSignalListener` |
+| `src/readiness.rs` | `RawSource`, `GatotkacaReadiness`, `GatotkacaRegistration` (the level contract is in its module docs) |
 | `src/task_local.rs` | `GatotkacaTaskLocal` |
 | `src/macros.rs` | `declare_runtime!`, the typed process-wide singleton |
 | `src/tests/tokio_impl.rs` | **Reference implementation** of every trait on tokio. Read it first when implementing. |
@@ -38,6 +42,7 @@ OwnedRuntime ──handle()──▶ GatotkacaRuntimeHandle ──spawn()──�
    │                          ├─timer()──────▶ GatotkacaTimer ──run_after / run_every──▶ TimerTask
    │                          │                                ──interval()───────────▶ Interval
    │                          ├─signals()────▶ GatotkacaSignals ──listen()─────────────▶ Listener
+   │                          ├─readiness()──▶ GatotkacaReadiness ──register(raw)──────▶ Registration: readable / writable / clear_*
    │                          └─shutdown_token()──▶ GatotkacaCancellationToken
    └─ wrapped by GatotkacaRuntime<R>, made global by declare_runtime!(R)
 
@@ -69,6 +74,7 @@ Define these types, usually in your own crate:
 | cancellation token | `GatotkacaCancellationToken` | `tokio_util::sync::CancellationToken` |
 | signals, listener | `GatotkacaSignals`, `GatotkacaSignalListener` | `TokioSignals`, `TokioSignalListener` |
 | task-local key | `GatotkacaTaskLocal` | `tokio::task::LocalKey<T>` |
+| readiness, registration | `GatotkacaReadiness`, `GatotkacaRegistration` | `TokioReadiness`, `TokioRegistration` (`AsyncFd` over a borrowed fd, unix only) |
 
 ### Behaviour every implementation must provide
 
@@ -106,6 +112,20 @@ Consumers rely on these, so every executor has to behave the same way. The tests
 - An unsupported signal returns `io::ErrorKind::Unsupported`. `Hangup` is Unix only.
 - Deliveries between `recv` calls may merge into one. `recv` returns `None` once no more can arrive.
 
+**Readiness** (full contract: `src/readiness.rs` module docs)
+- `register` is `unsafe`: the caller keeps the raw fd / socket open, as the same object, until the registration is dropped.
+  The registration borrows it; dropping the registration deregisters it and closes nothing.
+- **Level semantics.** A wait keeps resolving at once until the caller, after a `WouldBlock`, calls `clear_readable` /
+  `clear_writable`. Waiting never consumes readiness.
+- **Clearing never loses a wake-up.** If the object is ready at the OS level when `clear_*` runs, or becomes ready later, the
+  next wait resolves. Over an edge-triggered poller (tokio, mio) check the level when clearing: the reference takes tokio's
+  ready guard first, then a zero-timeout `poll(2)`, and clears only if the fd is not ready.
+- An object already ready at registration wakes the first wait. End of file, hang-up and errors count as ready.
+- `register` works from any thread and fails once shutdown has begun. One live registration per source; one waiter per
+  direction.
+- Windows: mio cannot register foreign sockets, so a Windows implementation needs its own poller (for example a `WSAPoll`
+  thread over the registered sockets, woken by a socket pair when the set changes). The reference returns `Unsupported`.
+
 **Task-locals**
 - Interface only: the implementation chooses how keys are declared and stored. `with` panics outside a scope, and `try_with`
   returns `None` there.
@@ -130,4 +150,6 @@ cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+# Pure Rust, so plain cross checks work (needs `rustup target add x86_64-pc-windows-msvc`):
+cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 ```

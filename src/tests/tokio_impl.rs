@@ -14,6 +14,7 @@ use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tokio_util::task::TaskTracker;
 
 use crate::cancellation::GatotkacaCancellationToken;
+use crate::readiness::{GatotkacaReadiness, GatotkacaRegistration, RawSource};
 use crate::runtime::{GatotkacaJoinHandle, GatotkacaRuntimeHandle, OwnedRuntime, ShutdownResult};
 use crate::signals::{GatotkacaSignalListener, GatotkacaSignals, Signal};
 use crate::task_local::GatotkacaTaskLocal;
@@ -90,6 +91,7 @@ impl GatotkacaRuntimeHandle for TokioHandle {
     type Timer = TokioHandle;
     type Signals = TokioSignals;
     type CancellationToken = CancellationToken;
+    type Readiness = TokioReadiness;
 
     fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
@@ -130,6 +132,10 @@ impl GatotkacaRuntimeHandle for TokioHandle {
 
     fn shutdown_token(&self) -> CancellationToken {
         self.shared.shutdown.child_token()
+    }
+
+    fn readiness(&self) -> TokioReadiness {
+        TokioReadiness { inner: self.inner.clone(), shared: self.shared.clone() }
     }
 }
 
@@ -351,5 +357,143 @@ impl<T: 'static> GatotkacaTaskLocal for LocalKey<T> {
         F: FnOnce(&T) -> R,
     {
         LocalKey::try_with(self, f).ok()
+    }
+}
+
+/// Readiness through tokio's reactor: `AsyncFd` on unix.
+///
+/// tokio (mio) polls edge-triggered and caches readiness per registration until it is cleared. Two details make that fit the
+/// level contract of [`crate::readiness`]:
+///
+/// - waiting drops tokio's ready guard without clearing it, so readiness stays set until `clear_*`;
+/// - clearing takes a guard first (it carries tokio's readiness tick), then asks the OS for the object's level with a
+///   zero-timeout `poll(2)`, and clears only if the object is not ready. An edge processed after the guard was taken changes
+///   the tick, and tokio then ignores the clear; an edge before it shows up in `poll(2)`. No wake-up is lost.
+///
+/// Windows has no `AsyncFd`, and mio cannot register a socket it does not own, so a Windows implementation needs its own poller
+/// (for example one `WSAPoll` thread over the registered sockets, woken through a socket pair when the set changes). This
+/// reference implementation returns `Unsupported` there.
+#[derive(Clone)]
+pub struct TokioReadiness {
+    inner: Handle,
+    shared: Arc<Shared>,
+}
+
+impl GatotkacaReadiness for TokioReadiness {
+    type Registration = TokioRegistration;
+
+    unsafe fn register(&self, source: RawSource) -> io::Result<TokioRegistration> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Err(io::Error::other("Gatotkaca runtime is shut down"));
+        }
+        #[cfg(unix)]
+        {
+            use tokio::io::Interest;
+            use tokio::io::unix::AsyncFd;
+            // `AsyncFd` finds the reactor through the thread's runtime context; entering lets `register` run on any thread.
+            let _ctx = self.inner.enter();
+            // SAFETY: the caller of `register` keeps `source` open, referring to the same file description, until the
+            // registration (which owns this `AsyncFd`) is dropped; `BorrowedSource` always returns that same number.
+            let fd = unsafe { AsyncFd::register_with_interest(BorrowedSource(source), Interest::READABLE | Interest::WRITABLE) }?;
+            Ok(TokioRegistration { fd })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (source, &self.inner);
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+}
+
+/// A raw file descriptor the registration does not own: dropping it closes nothing.
+#[cfg(unix)]
+struct BorrowedSource(RawSource);
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for BorrowedSource {
+    fn as_raw_fd(&self) -> RawSource {
+        self.0
+    }
+}
+
+/// One registered descriptor. Dropping the `AsyncFd` deregisters it from the reactor and leaves the descriptor open.
+#[cfg(unix)]
+pub struct TokioRegistration {
+    fd: tokio::io::unix::AsyncFd<BorrowedSource>,
+}
+
+#[cfg(unix)]
+impl TokioRegistration {
+    /// Clears one direction unless the descriptor is ready at the OS level right now (see [`TokioReadiness`]).
+    fn clear(&self, read: bool) {
+        use std::os::fd::AsRawFd;
+        use std::task::{Context, Poll, Waker};
+        let events = if read { libc::POLLIN } else { libc::POLLOUT };
+        // Not ready in tokio's view: nothing to clear. The no-op waker is stored only in the slot `poll_*_ready` uses, never in
+        // the waiter list that `readable` / `writable` use, so pending waits keep their wakers. `unconstrained` keeps tokio's
+        // task budget from turning a ready poll into `Pending`.
+        let mut clear = std::pin::pin!(tokio::task::unconstrained(std::future::poll_fn(|cx| {
+            let ready = if read { self.fd.poll_read_ready(cx) } else { self.fd.poll_write_ready(cx) };
+            if let Poll::Ready(Ok(mut guard)) = ready
+                && !os_ready(self.fd.as_raw_fd(), events)
+            {
+                guard.clear_ready();
+            }
+            Poll::Ready(())
+        })));
+        let _ = clear.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+    }
+}
+
+/// Whether `fd` reports any of `events` (or an error, hang-up or invalid descriptor) right now.
+#[cfg(unix)]
+fn os_ready(fd: RawSource, events: libc::c_short) -> bool {
+    let mut entry = libc::pollfd { fd, events, revents: 0 };
+    // SAFETY: `entry` is one valid, writable `pollfd`, and the count passed is 1. A zero timeout never blocks.
+    let found = unsafe { libc::poll(&mut entry, 1, 0) };
+    // On a poll failure (EINTR, ENOMEM) report ready: a spurious wake-up is allowed, a lost one is not.
+    found != 0
+}
+
+#[cfg(unix)]
+impl GatotkacaRegistration for TokioRegistration {
+    async fn readable(&self) -> io::Result<()> {
+        // The guard is dropped without `clear_ready`, so readiness stays set until `clear_readable`.
+        self.fd.readable().await.map(drop)
+    }
+
+    async fn writable(&self) -> io::Result<()> {
+        self.fd.writable().await.map(drop)
+    }
+
+    fn clear_readable(&self) {
+        self.clear(true);
+    }
+
+    fn clear_writable(&self) {
+        self.clear(false);
+    }
+}
+
+/// No registrations exist where `register` is unsupported.
+#[cfg(not(unix))]
+pub struct TokioRegistration(std::convert::Infallible);
+
+#[cfg(not(unix))]
+impl GatotkacaRegistration for TokioRegistration {
+    async fn readable(&self) -> io::Result<()> {
+        match self.0 {}
+    }
+
+    async fn writable(&self) -> io::Result<()> {
+        match self.0 {}
+    }
+
+    fn clear_readable(&self) {
+        match self.0 {}
+    }
+
+    fn clear_writable(&self) {
+        match self.0 {}
     }
 }

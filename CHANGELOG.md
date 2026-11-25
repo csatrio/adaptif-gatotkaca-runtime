@@ -7,6 +7,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-26
+
+Breaking for implementors: `GatotkacaRuntimeHandle` has a new associated type and method. Code that only calls the facade is
+unaffected.
+
+### Added
+
+- `readiness` module: wait until a raw OS object may be read or written, through the runtime's own poller.
+  - `RawSource`: `RawFd` on unix, `RawSocket` on Windows (uninhabited elsewhere).
+  - `GatotkacaReadiness`: `unsafe fn register(&self, RawSource)`. The registration borrows the object, which must stay open
+    until the registration is dropped; dropping it deregisters and closes nothing. Fails once shutdown has begun.
+  - `GatotkacaRegistration`: `readable`, `writable`, `clear_readable` and `clear_writable`, with level semantics: a wait
+    resolves at once until the caller, having seen `WouldBlock`, clears it, and clearing never loses a wake-up (an
+    implementation over an edge-triggered poller checks the level when clearing). An object ready at registration wakes the
+    first wait; end of file, hang-up and errors count as ready.
+- `GatotkacaRuntimeHandle::Readiness` and `GatotkacaRuntimeHandle::readiness()`.
+- Reference implementation on tokio `AsyncFd` (unix) in the tests, with tests for pipes and socket pairs. Windows
+  implementations need their own poller (for example a `WSAPoll` thread); the reference returns `Unsupported` there.
+
+### Changed
+
+- Lints deny `unsafe_op_in_unsafe_fn`, undocumented `unsafe` blocks and `unsafe fn` without a `# Safety` section.
+
 ## [0.1.0] - 2026-11-24
 
 ### Added
@@ -30,5 +53,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `task_local` module: `GatotkacaTaskLocal`, an interface only; implementations choose how keys are stored.
 - A documented safety contract for thread-per-core runtimes that meet the `Send + Sync` bounds with `unsafe impl`.
 
-[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-runtime/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/csatrio/adaptif-gatotkaca-runtime/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/csatrio/adaptif-gatotkaca-runtime/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/csatrio/adaptif-gatotkaca-runtime/releases/tag/v0.1.0

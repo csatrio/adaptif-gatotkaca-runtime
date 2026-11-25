@@ -15,7 +15,8 @@ thread-per-core runtime gives the most throughput.
 This crate makes the **whole gatotkaca runtime model uniform**. Whichever executor runs underneath, code that uses gatotkaca
 has the same:
 
-- **shape:** one set of traits for running, spawning, timing, cancelling, signalling and task-local state;
+- **shape:** one set of traits for running, spawning, timing, cancelling, signalling, waiting for I/O readiness and
+  task-local state;
 - **flow:** install once, enter with `block_on`, fan out through a handle, shut down gracefully;
 - **execution path:** the same rules for panics, cancellation, missed timer ticks, shutdown order and signal handling.
 
@@ -30,7 +31,7 @@ than object-safe, so the executor is known at compile time and calls go straight
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-runtime = "0.1"
+adaptif-gatotkaca-runtime = "0.2"
 ```
 
 You also need an implementation crate that provides a concrete runtime.
@@ -75,6 +76,7 @@ rt::get().shutdown(Some(Duration::from_secs(10)));
 install ──▶ block_on (host thread) ──▶ handle ──┬─ spawn / spawn_blocking / block_in_place
                                                 ├─ timer: sleep, timeout, interval, run_after, run_every
                                                 ├─ signals: listen, ctrl_c
+                                                ├─ readiness: register a raw fd / socket, then readable, writable, clear_*
                                                 └─ shutdown_token
 shutdown: refuse new work ─▶ cancel shutdown token ─▶ wait up to timeout ─▶ abort the rest
 ```
@@ -85,6 +87,7 @@ shutdown: refuse new work ─▶ cancel shutdown token ─▶ wait up to timeout
 | `timers` | `GatotkacaTimer`, `GatotkacaInterval`, `GatotkacaTimerTask` |
 | `cancellation` | `GatotkacaCancellationToken` |
 | `signals` | `Signal`, `GatotkacaSignals`, `GatotkacaSignalListener` |
+| `readiness` | `RawSource`, `GatotkacaReadiness`, `GatotkacaRegistration` |
 | `task_local` | `GatotkacaTaskLocal` |
 | crate root | `declare_runtime!` |
 
@@ -95,6 +98,36 @@ Guarantees every implementation provides:
 - Intervals skip missed ticks instead of firing them in a burst.
 - Signal handlers are installed only when something listens, so Python and Node keep control of Ctrl-C.
 - After shutdown begins, new work is refused and its join handle resolves to a cancellation error.
+- Readiness is level-triggered, whatever the executor polls with: a wait resolves at once until the caller, having seen
+  `WouldBlock`, clears it, and clearing never loses a wake-up.
+
+## Waiting for readiness
+
+The runtime's poller can watch an OS object your code owns: a file descriptor on unix, a socket on Windows. You keep doing
+the non-blocking I/O yourself and come back to wait only after it returns `WouldBlock`:
+
+```rust,ignore
+use adaptif_gatotkaca_runtime::readiness::{GatotkacaReadiness, GatotkacaRegistration};
+
+// SAFETY: `receiver` stays open until `registration` is dropped.
+let registration = unsafe { handle.readiness().register(receiver.as_raw_fd()) }?;
+loop {
+    registration.readable().await?;
+    loop {
+        match receiver.try_recv() {
+            Ok(message) => process(message),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+    }
+    registration.clear_readable();
+}
+```
+
+`register` is `unsafe` because the registration borrows the raw object: it must stay open, as the same object, until the
+registration is dropped. Dropping the registration deregisters the object and closes nothing. The full contract is in the
+`readiness` module docs. On Windows an implementation needs its own poller (mio cannot register foreign sockets), for example
+one `WSAPoll` thread over the registered sockets.
 
 ## Implementing the interface
 
@@ -130,10 +163,11 @@ Early development (0.x). The interface may still change between minor versions; 
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
 ```
 
-tokio and tokio-util are dev-dependencies only. The tests implement every trait on tokio to prove the interface fits a real
-executor.
+tokio, tokio-util and (on unix) libc are dev-dependencies only. The tests implement every trait on tokio to prove the
+interface fits a real executor; readiness is implemented there on unix only.
 
 ## License
 
