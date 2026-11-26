@@ -1,5 +1,6 @@
 //! Tests for every trait and the singleton macro, run against the tokio implementation in `tokio_impl`.
 
+mod fs_impl;
 mod tokio_impl;
 
 use std::sync::Arc;
@@ -801,5 +802,359 @@ mod readiness {
         // SAFETY: registration fails, so nothing outlives `ours`.
         let result = unsafe { readiness.register(ours.as_raw_fd()) };
         assert!(result.is_err());
+    }
+}
+
+/// The `fs` traits, run against `std::fs` both on the tokio blocking pool and inline.
+mod filesystem {
+    use std::fs::{FileTimes, TryLockError};
+    use std::future::Future;
+    use std::io::{ErrorKind, SeekFrom};
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    use super::fs_impl::{Inline, InlineFs, TokioFs};
+    use super::*;
+    use crate::fs::{GatotkacaDirEntry, GatotkacaFile, GatotkacaFs, GatotkacaReadDir, OpenOptions};
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let unique = NEXT.fetch_add(1, Ordering::SeqCst);
+            let dir = std::env::temp_dir().join(format!("gatotkaca-fs-{}-{name}-{unique}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.0.join(relative)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Runs each check against both reference filesystems, as `tokio_pool::<check>` and `inline::<check>`.
+    macro_rules! on_every_fs {
+        ($($check:ident),* $(,)?) => {
+            mod tokio_pool {
+                $(
+                    #[test]
+                    fn $check() {
+                        let rt = super::runtime();
+                        let fs = super::TokioFs::new(rt.handle());
+                        rt.block_on(super::$check(fs, super::Scratch::new(stringify!($check))));
+                    }
+                )*
+            }
+            mod inline {
+                $(
+                    #[test]
+                    fn $check() {
+                        let rt = super::runtime();
+                        let fs = super::InlineFs::new(super::Inline);
+                        rt.block_on(super::$check(fs, super::Scratch::new(stringify!($check))));
+                    }
+                )*
+            }
+        };
+    }
+
+    on_every_fs!(
+        whole_files,
+        copy_rename_remove_and_links,
+        directories,
+        positional_io,
+        cursor_io,
+        open_options,
+        permissions_and_times,
+        advisory_locks,
+    );
+
+    async fn whole_files<F: GatotkacaFs>(fs: F, dir: Scratch) {
+        let path = dir.path("a.txt");
+        assert!(!fs.exists(&path).await.unwrap());
+        fs.write(&path, "hello").await.unwrap();
+        assert!(fs.exists(&path).await.unwrap());
+        assert_eq!(fs.read(&path).await.unwrap(), b"hello");
+        assert_eq!(fs.read_to_string(&path).await.unwrap(), "hello");
+        assert_eq!(fs.metadata(&path).await.unwrap().len(), 5);
+
+        fs.write(&path, vec![0xff, 0xfe]).await.unwrap();
+        assert_eq!(fs.read_to_string(&path).await.unwrap_err().kind(), ErrorKind::InvalidData);
+        assert_eq!(fs.read(dir.path("missing")).await.unwrap_err().kind(), ErrorKind::NotFound);
+    }
+
+    async fn copy_rename_remove_and_links<F: GatotkacaFs>(fs: F, dir: Scratch) {
+        let original = dir.path("a");
+        fs.write(&original, "abc").await.unwrap();
+        assert_eq!(fs.copy(&original, dir.path("b")).await.unwrap(), 3);
+        fs.rename(dir.path("b"), dir.path("c")).await.unwrap();
+        assert!(!fs.exists(dir.path("b")).await.unwrap());
+        assert_eq!(fs.read(dir.path("c")).await.unwrap(), b"abc");
+
+        fs.hard_link(&original, dir.path("h")).await.unwrap();
+        fs.remove_file(&original).await.unwrap();
+        assert!(!fs.exists(&original).await.unwrap());
+        assert_eq!(fs.read(dir.path("h")).await.unwrap(), b"abc");
+        assert_eq!(fs.remove_file(&original).await.unwrap_err().kind(), ErrorKind::NotFound);
+
+        assert_eq!(fs.canonicalize(dir.path("c")).await.unwrap(), std::fs::canonicalize(dir.path("c")).unwrap());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path("c"), dir.path("s")).unwrap();
+            assert_eq!(fs.read_link(dir.path("s")).await.unwrap(), dir.path("c"));
+            assert!(fs.symlink_metadata(dir.path("s")).await.unwrap().is_symlink());
+            assert!(fs.metadata(dir.path("s")).await.unwrap().is_file());
+            fs.remove_file(dir.path("c")).await.unwrap();
+            // A broken link does not exist.
+            assert!(!fs.exists(dir.path("s")).await.unwrap());
+        }
+    }
+
+    async fn directories<F: GatotkacaFs>(fs: F, dir: Scratch) {
+        let nested = dir.path("x/y/z");
+        assert_eq!(fs.create_dir(&nested).await.unwrap_err().kind(), ErrorKind::NotFound);
+        fs.create_dir_all(&nested).await.unwrap();
+        fs.write(nested.join("f"), "1").await.unwrap();
+        fs.create_dir(dir.path("x/empty")).await.unwrap();
+        fs.write(dir.path("x/file"), "2").await.unwrap();
+
+        let mut listing = fs.read_dir(dir.path("x")).await.unwrap();
+        let mut seen = Vec::new();
+        while let Some(entry) = listing.next_entry().await.unwrap() {
+            assert_eq!(entry.path(), dir.path("x").join(entry.file_name()));
+            let is_dir = entry.file_type().await.unwrap().is_dir();
+            assert_eq!(entry.metadata().await.unwrap().is_dir(), is_dir);
+            seen.push((entry.file_name().into_string().unwrap(), is_dir));
+        }
+        seen.sort();
+        assert_eq!(seen, [("empty".into(), true), ("file".into(), false), ("y".into(), true)]);
+        // Exhausted stays exhausted.
+        assert!(listing.next_entry().await.unwrap().is_none());
+
+        assert_eq!(fs.remove_dir(dir.path("x/y")).await.unwrap_err().kind(), ErrorKind::DirectoryNotEmpty);
+        fs.remove_dir(dir.path("x/empty")).await.unwrap();
+        fs.remove_dir_all(dir.path("x")).await.unwrap();
+        assert!(!fs.exists(dir.path("x")).await.unwrap());
+    }
+
+    async fn positional_io<F: GatotkacaFs>(fs: F, dir: Scratch) {
+        let file = fs.create_new(dir.path("p")).await.unwrap();
+        let (result, buf) = file.write_all_at(b"0123456789".to_vec(), 0).await;
+        result.unwrap();
+        assert_eq!(buf, b"0123456789", "the buffer comes back");
+        let (written, _) = file.write_at(b"ab".to_vec(), 4).await;
+        assert_eq!(written.unwrap(), 2);
+        let contents = b"0123ab6789";
+
+        // Reads go after the existing contents, into spare capacity only.
+        let mut buf = Vec::with_capacity(5);
+        buf.push(b'>');
+        let (read, buf) = file.read_at(buf, 2).await;
+        let read = read.unwrap();
+        assert!(read > 0);
+        assert_eq!(buf[0], b'>');
+        assert_eq!(&buf[1..], &contents[2..2 + read]);
+
+        let buf = Vec::with_capacity(4);
+        let want = buf.capacity();
+        let (result, buf) = file.read_exact_at(buf, 3).await;
+        result.unwrap();
+        assert_eq!(buf, &contents[3..3 + want]);
+
+        // No spare capacity reads nothing.
+        let (read, buf) = file.read_at(Vec::new(), 0).await;
+        assert_eq!(read.unwrap(), 0);
+        assert!(buf.is_empty());
+
+        let (read, _) = file.read_at(Vec::with_capacity(4), 10).await;
+        assert_eq!(read.unwrap(), 0, "end of file");
+        let (result, buf) = file.read_exact_at(Vec::with_capacity(4), 8).await;
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::UnexpectedEof);
+        assert!(buf.capacity() >= 4, "the buffer comes back on error too");
+
+        // Positional calls take `&self`, so several can be in flight on one file.
+        let (first, second) = tokio::join!(file.read_exact_at(Vec::with_capacity(2), 0), file.read_exact_at(Vec::with_capacity(2), 4));
+        first.0.unwrap();
+        second.0.unwrap();
+        assert_eq!((first.1, second.1), (b"01".to_vec(), b"ab".to_vec()));
+    }
+
+    async fn cursor_io<F: GatotkacaFs>(fs: F, dir: Scratch) {
+        let path = dir.path("c");
+        let mut file = fs.open_with(&path, OpenOptions::new().read(true).write(true).create(true)).await.unwrap();
+        let (result, _) = file.write_all(b"hello world".to_vec()).await;
+        result.unwrap();
+        assert_eq!(file.stream_position().await.unwrap(), 11);
+        file.flush().await.unwrap();
+
+        assert_eq!(file.seek(SeekFrom::Start(6)).await.unwrap(), 6);
+        let (result, buf) = file.read_exact(Vec::with_capacity(5)).await;
+        result.unwrap();
+        assert_eq!(buf, b"world");
+
+        file.rewind().await.unwrap();
+        let (read, buf) = file.read_to_end(b"<".to_vec()).await;
+        assert_eq!(read.unwrap(), 11);
+        assert_eq!(buf, b"<hello world");
+        let (read, _) = file.read(Vec::with_capacity(4)).await;
+        assert_eq!(read.unwrap(), 0, "end of file");
+        let (result, _) = file.read_exact(Vec::with_capacity(4)).await;
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::UnexpectedEof);
+
+        file.seek(SeekFrom::Start(0)).await.unwrap();
+        let (written, _) = file.write(b"J".to_vec()).await;
+        assert_eq!(written.unwrap(), 1);
+        file.set_len(5).await.unwrap();
+        assert_eq!(file.metadata().await.unwrap().len(), 5);
+        assert_eq!(file.stream_position().await.unwrap(), 1, "set_len leaves the cursor alone");
+        file.sync_all().await.unwrap();
+        file.sync_data().await.unwrap();
+        assert_eq!(fs.read(&path).await.unwrap(), b"Jello");
+
+        // Append writes at the end, wherever the cursor is.
+        let mut log = fs.open_with(&path, OpenOptions::new().append(true)).await.unwrap();
+        log.seek(SeekFrom::Start(0)).await.unwrap();
+        let (result, _) = log.write_all(b"!".to_vec()).await;
+        result.unwrap();
+        assert_eq!(fs.read(&path).await.unwrap(), b"Jello!");
+
+        // A clone shares the cursor.
+        let mut clone = file.try_clone().await.unwrap();
+        file.seek(SeekFrom::Start(2)).await.unwrap();
+        assert_eq!(clone.stream_position().await.unwrap(), 2);
+    }
+
+    async fn open_options<F: GatotkacaFs>(fs: F, dir: Scratch) {
+        let path = dir.path("o");
+        assert_eq!(fs.open(&path).await.err().unwrap().kind(), ErrorKind::NotFound);
+        fs.create_new(&path).await.unwrap();
+        assert_eq!(fs.create_new(&path).await.err().unwrap().kind(), ErrorKind::AlreadyExists);
+
+        fs.write(&path, "long contents").await.unwrap();
+        fs.create(&path).await.unwrap();
+        assert_eq!(fs.metadata(&path).await.unwrap().len(), 0, "create truncates");
+
+        let mut read_only = fs.open(&path).await.unwrap();
+        let (written, _) = read_only.write(b"x".to_vec()).await;
+        assert!(written.is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let private = dir.path("private");
+            fs.open_with(&private, OpenOptions::new().write(true).create(true).mode(0o600)).await.unwrap();
+            assert_eq!(fs.metadata(&private).await.unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    async fn permissions_and_times<F: GatotkacaFs>(fs: F, dir: Scratch) {
+        let path = dir.path("t");
+        fs.write(&path, "x").await.unwrap();
+        let original = fs.metadata(&path).await.unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_readonly(true);
+        fs.set_permissions(&path, read_only).await.unwrap();
+        assert!(fs.metadata(&path).await.unwrap().permissions().readonly());
+        fs.set_permissions(&path, original.clone()).await.unwrap();
+        assert!(!fs.metadata(&path).await.unwrap().permissions().readonly());
+
+        let file = fs.open_with(&path, OpenOptions::new().write(true)).await.unwrap();
+        file.set_permissions(original).await.unwrap();
+        let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        file.set_modified(modified).await.unwrap();
+        assert_eq!(file.metadata().await.unwrap().modified().unwrap(), modified);
+        let later = modified + Duration::from_secs(60);
+        file.set_times(FileTimes::new().set_modified(later)).await.unwrap();
+        assert_eq!(fs.metadata(&path).await.unwrap().modified().unwrap(), later);
+    }
+
+    async fn advisory_locks<F: GatotkacaFs>(fs: F, dir: Scratch) {
+        let path = dir.path("l");
+        // Two separate opens, so two separate locks.
+        let first = fs.create(&path).await.unwrap();
+        let second = fs.open(&path).await.unwrap();
+
+        first.lock().await.unwrap();
+        assert!(matches!(second.try_lock_shared().await, Err(TryLockError::WouldBlock)));
+        first.unlock().await.unwrap();
+
+        second.lock_shared().await.unwrap();
+        first.try_lock_shared().await.unwrap();
+        assert!(matches!(second.try_lock().await, Err(TryLockError::WouldBlock)));
+        first.unlock().await.unwrap();
+        second.unlock().await.unwrap();
+        first.try_lock().await.unwrap();
+    }
+
+    #[test]
+    fn lock_wait_does_not_block_other_tasks() {
+        let rt = runtime();
+        let handle = rt.handle();
+        let fs = TokioFs::new(handle.clone());
+        let dir = Scratch::new("lock_wait");
+        let path = dir.path("l");
+        rt.block_on(async {
+            let holder = fs.create(&path).await.unwrap();
+            holder.lock().await.unwrap();
+            let waiter = fs.open(&path).await.unwrap();
+            let waiting = handle.spawn(async move { waiter.lock().await });
+            // The waiter is parked on the blocking pool; timers and other tasks still run.
+            handle.timer().sleep(Duration::from_millis(50)).await;
+            assert!(!GatotkacaJoinHandle::is_finished(&waiting));
+            holder.unlock().await.unwrap();
+            handle.timer().timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn read_dir_is_cancel_safe() {
+        let rt = runtime();
+        let fs = TokioFs::new(rt.handle());
+        let dir = Scratch::new("cancel");
+        for name in ["a", "b", "c", "d"] {
+            std::fs::write(dir.path(name), name).unwrap();
+        }
+        let count = rt.block_on(async {
+            let mut listing = fs.read_dir(&dir.0).await.unwrap();
+            // Poll once, which starts the fetch on the blocking pool, then drop the future mid-flight.
+            let first = {
+                let mut next = std::pin::pin!(listing.next_entry());
+                std::future::poll_fn(|cx| std::task::Poll::Ready(next.as_mut().poll(cx))).await
+            };
+            assert!(first.is_pending(), "the fetch should still be in flight");
+            let mut count = 0;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            while listing.next_entry().await.unwrap().is_some() {
+                count += 1;
+            }
+            count
+        });
+        assert_eq!(count, 4, "no entry lost to the cancelled call");
+    }
+
+    #[test]
+    fn calls_fail_after_shutdown_and_return_no_buffer() {
+        let rt = runtime();
+        let fs = TokioFs::new(rt.handle());
+        let dir = Scratch::new("shutdown");
+        let path = dir.path("s");
+        std::fs::write(&path, "data").unwrap();
+        let file = rt.block_on(fs.open(&path)).unwrap();
+        rt.shutdown(Some(Duration::from_secs(1)));
+
+        let other = tokio::runtime::Runtime::new().unwrap();
+        assert!(other.block_on(fs.read(&path)).is_err());
+        let (result, buf) = other.block_on(file.read_at(Vec::with_capacity(4), 0));
+        assert!(result.is_err());
+        assert!(buf.is_empty());
     }
 }

@@ -31,8 +31,10 @@ source of truth; this file is the map.
 | `src/signals.rs` | `Signal`, `GatotkacaSignals`, `GatotkacaSignalListener` |
 | `src/readiness.rs` | `RawSource`, `GatotkacaReadiness`, `GatotkacaRegistration` (the level contract is in its module docs) |
 | `src/task_local.rs` | `GatotkacaTaskLocal` |
+| `src/fs.rs` | `GatotkacaFs`, `GatotkacaFile`, `GatotkacaReadDir`, `GatotkacaDirEntry`, `OpenOptions` (buffer and cancellation contract in its module docs) |
 | `src/macros.rs` | `declare_runtime!`, the typed process-wide singleton |
 | `src/tests/tokio_impl.rs` | **Reference implementation** of every trait on tokio. Read it first when implementing. |
+| `src/tests/fs_impl.rs` | **Reference `fs` implementation**: `std::fs` through an `Offload` strategy, on tokio's blocking pool (`TokioFs`) or inline (`InlineFs`) |
 | `src/tests.rs` | Behaviour tests against the reference implementation |
 
 ## How the pieces connect
@@ -48,6 +50,10 @@ OwnedRuntime ──handle()──▶ GatotkacaRuntimeHandle ──spawn()──�
    └─ wrapped by GatotkacaRuntime<R>, made global by declare_runtime!(R)
 
 GatotkacaTaskLocal stands alone: keys are statics the implementation declares.
+GatotkacaFs stands alone too: chosen separately from the handle, so any runtime can pair with any filesystem.
+   GatotkacaFs ──open / create / open_with──▶ File: positional (&self) + cursor (&mut self)
+               ├─read_dir──▶ ReadDir ──next_entry──▶ DirEntry
+               └─read / write / copy / rename / remove_* / create_dir* / metadata / … (all of std::fs)
 ```
 
 Execution flow, the same on every executor:
@@ -76,6 +82,7 @@ Define these types, usually in your own crate:
 | signals, listener | `GatotkacaSignals`, `GatotkacaSignalListener` | `TokioSignals`, `TokioSignalListener` |
 | task-local key | `GatotkacaTaskLocal` | `tokio::task::LocalKey<T>` |
 | readiness, registration | `GatotkacaReadiness`, `GatotkacaRegistration` | `TokioReadiness`, `TokioRegistration` (`AsyncFd` over a borrowed fd, unix only) |
+| filesystem (optional, standalone) | `GatotkacaFs`, `GatotkacaFile`, `GatotkacaReadDir`, `GatotkacaDirEntry` | `StdFs<X>`, `StdFile<X>`, … in `fs_impl.rs` |
 
 ### Behaviour every implementation must provide
 
@@ -130,6 +137,18 @@ Consumers rely on these, so every executor has to behave the same way. The tests
   direction.
 - Windows: mio cannot register foreign sockets, so a Windows implementation needs its own poller (for example a `WSAPoll`
   thread over the registered sockets, woken by a socket pair when the set changes). The reference returns `Unsupported`.
+
+**Filesystem** (full contract: `src/fs.rs` module docs)
+- Mirrors `std::fs` one for one, returning std's own types; error kinds are the OS's, as std reports them.
+- **Owned buffers.** Reads and writes take a `Vec<u8>` and return it with the result, on success and on error. Reads fill
+  spare capacity (`capacity - len`) after the existing contents; no spare capacity reads `Ok(0)`. Writes write `buf[..]`.
+  Only if the call cannot run at all (runtime gone) may the buffer come back empty.
+- Futures are `Send` and lazy. Dropping one does not undo a started operation; a cancelled cursor call leaves the cursor
+  unspecified. `next_entry` is cancel-safe: the reference parks fetched entries in a queue so a dropped call loses none.
+- Positional calls (`&self`) ignore the cursor and may run concurrently; whether they move it is platform-defined (Windows
+  does). Cursor calls (`&mut self`) behave like `Read` / `Write` / `Seek` on a `File`. An implementation with no OS cursor
+  (io_uring) keeps its own. `try_clone` shares cursor and lock.
+- Blocking calls (`lock`, large reads) must not stall other tasks unless the implementation is explicitly inline.
 
 **Task-locals**
 - Interface only: the implementation chooses how keys are declared and stored. `with` panics outside a scope, and `try_with`

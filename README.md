@@ -15,8 +15,8 @@ thread-per-core runtime gives the most throughput.
 This crate makes the **whole gatotkaca runtime model uniform**. Whichever executor runs underneath, code that uses gatotkaca
 has the same:
 
-- **shape:** one set of traits for running, spawning, timing, cancelling, signalling, waiting for I/O readiness and
-  task-local state;
+- **shape:** one set of traits for running, spawning, timing, cancelling, signalling, waiting for I/O readiness, filesystem
+  access and task-local state;
 - **flow:** install once, enter with `block_on`, fan out through a handle, shut down gracefully;
 - **execution path:** the same rules for panics, cancellation, missed timer ticks, shutdown order and signal handling.
 
@@ -89,6 +89,7 @@ shutdown: refuse new work ─▶ cancel shutdown token ─▶ wait up to timeout
 | `signals` | `Signal`, `GatotkacaSignals`, `GatotkacaSignalListener` |
 | `readiness` | `RawSource`, `GatotkacaReadiness`, `GatotkacaRegistration` |
 | `task_local` | `GatotkacaTaskLocal` |
+| `fs` | `GatotkacaFs`, `GatotkacaFile`, `GatotkacaReadDir`, `GatotkacaDirEntry`, `OpenOptions`: `std::fs`, asynchronous, with owned buffers; standalone from the handle |
 | crate root | `declare_runtime!` |
 
 Guarantees every implementation provides:

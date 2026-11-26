@@ -11,6 +11,24 @@ Breaking for implementors: `GatotkacaRuntimeHandle` has a new required method. C
 
 ### Added
 
+- `fs` module: the operations of `std::fs`, made asynchronous, so the filesystem can be std on a blocking pool, tokio,
+  monoio / io_uring or inline std without changing callers. Standalone: chosen separately from the runtime handle.
+  - `GatotkacaFs`: every `std::fs` free function (`read`, `read_to_string`, `write`, `copy`, `rename`, `hard_link`,
+    `remove_file`, `create_dir`, `create_dir_all`, `remove_dir`, `remove_dir_all`, `read_dir`, `metadata`,
+    `symlink_metadata`, `set_permissions`, `canonicalize`, `read_link`, `exists`), plus `open_with`, `open`, `create` and
+    `create_new`.
+  - `GatotkacaFile`: positional I/O (`read_at`, `read_exact_at`, `write_at`, `write_all_at`, on `&self`) and cursor I/O
+    (`read`, `read_exact`, `read_to_end`, `write`, `write_all`, `flush`, `seek`, `stream_position`, `rewind`), plus
+    `sync_all`, `sync_data`, `set_len`, `metadata`, `set_permissions`, `set_times`, `set_modified`, `try_clone` and advisory
+    locks (`lock`, `lock_shared`, `try_lock`, `try_lock_shared`, `unlock`).
+  - `GatotkacaReadDir` (cancel-safe `next_entry`) and `GatotkacaDirEntry`.
+  - `OpenOptions`: a plain `Copy` value mirroring `std::fs::OpenOptions` (`mode` and `custom_flags` on unix), with `to_std`.
+  - Buffers are owned: reads and writes take a `Vec<u8>` and return it with the result, so completion-based implementations
+    are sound. Reads fill spare capacity; writes write `buf[..]`. Results use std's `Metadata`, `Permissions`, `FileType`,
+    `FileTimes`, `SeekFrom` and `TryLockError`.
+- Reference `fs` implementation on `std::fs` through an offload strategy: the tokio reference's blocking pool, and inline on
+  the polling thread. Both run the same tests.
+
 - `GatotkacaRuntimeHandle::spawn_local(make)`: runs a future that is not `Send`, pinned to one thread. `make` is a `Send`
   factory that the handle forwards to a thread the implementation chooses; it builds the future there, and the future is polled
   and dropped only on that thread. Callable from any thread. Returns the usual `JoinHandle`. Panics, abort, detach-on-drop and

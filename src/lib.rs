@@ -5,6 +5,7 @@
 //! in their own crates. See the README for the contract thread-per-core implementations must keep.
 
 pub mod cancellation;
+pub mod fs;
 mod macros;
 pub mod readiness;
 pub mod runtime;
