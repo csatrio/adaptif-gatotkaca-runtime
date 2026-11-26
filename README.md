@@ -31,7 +31,7 @@ than object-safe, so the executor is known at compile time and calls go straight
 
 ```toml
 [dependencies]
-adaptif-gatotkaca-runtime = "0.2"
+adaptif-gatotkaca-runtime = "0.3"
 ```
 
 You also need an implementation crate that provides a concrete runtime.
