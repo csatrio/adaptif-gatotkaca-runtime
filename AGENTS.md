@@ -39,6 +39,7 @@ source of truth; this file is the map.
 
 ```text
 OwnedRuntime ──handle()──▶ GatotkacaRuntimeHandle ──spawn()──────────▶ JoinHandle<T>: GatotkacaJoinHandle
+   │                          ├─spawn_local(make)──▶ JoinHandle<T> (future built and polled on one pinned thread)
    │                          ├─timer()──────▶ GatotkacaTimer ──run_after / run_every──▶ TimerTask
    │                          │                                ──interval()───────────▶ Interval
    │                          ├─signals()────▶ GatotkacaSignals ──listen()─────────────▶ Listener
@@ -54,7 +55,7 @@ Execution flow, the same on every executor:
 1. `rt::install(MyRuntime::create())` at startup. `create()` returns a running runtime with no configuration; implementations
    offer their own constructors for settings.
 2. Host threads (`main`, Python, Node, plain threads) enter through `rt::get().block_on(..)`.
-3. Inside, work fans out through the handle: `spawn`, `spawn_blocking`, timers, signals. Blocking work inside a task uses
+3. Inside, work fans out through the handle: `spawn`, `spawn_local`, `spawn_blocking`, timers, signals. Blocking work inside a task uses
    `block_in_place`.
 4. `rt::get().shutdown(timeout)`: graceful, then forced.
 
@@ -92,7 +93,11 @@ Consumers rely on these, so every executor has to behave the same way. The tests
 **Handle and join handles**
 - A panic in spawned work becomes a `JoinError`. The runtime keeps running.
 - Dropping a join handle **detaches** the task. `abort()` cancels it, and the handle then resolves to a cancellation error.
-- `block_in_place` frees the worker if it can, or runs the work in place.
+- `spawn_local(make)` takes a `Send` factory and works from any thread. The handle forwards `make` to a thread it chooses;
+  `make` builds the future there, and the future is polled and dropped only on that thread. Join handle, panic, abort and
+  shutdown rules are those of `spawn`; after shutdown begins `make` never runs. The reference wraps tokio-util
+  `LocalPoolHandle::spawn_pinned` (pool started on first use) in a tracked task that aborts the pinned task when dropped.
+- `block_in_place` frees the worker if it can, or runs the work in place. It never panics, including inside a local task.
 - `shutdown_token()` returns a **child** of the root token, so cancelling it never shuts the runtime down.
 
 **Timers**

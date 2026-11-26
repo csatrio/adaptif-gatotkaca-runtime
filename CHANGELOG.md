@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+Breaking for implementors: `GatotkacaRuntimeHandle` has a new required method. Code that only calls the facade is unaffected.
+
+### Added
+
+- `GatotkacaRuntimeHandle::spawn_local(make)`: runs a future that is not `Send`, pinned to one thread. `make` is a `Send`
+  factory that the handle forwards to a thread the implementation chooses; it builds the future there, and the future is polled
+  and dropped only on that thread. Callable from any thread. Returns the usual `JoinHandle`. Panics, abort, detach-on-drop and
+  shutdown (refused after it begins, waited on, then aborted) behave as for `spawn`.
+- Reference implementation on tokio-util `LocalPoolHandle::spawn_pinned`, wrapped in a task tracked by the runtime, with
+  tests.
+
+### Changed
+
+- `block_in_place` must not panic. An implementation that cannot free the worker, such as a local worker, runs the work in
+  place. The tokio reference now does so on non-multi-thread runtimes.
+
 ## [0.2.0] - 2026-11-26
 
 Breaking for implementors: `GatotkacaRuntimeHandle` has a new associated type and method. Code that only calls the facade is

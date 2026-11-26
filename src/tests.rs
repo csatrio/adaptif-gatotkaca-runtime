@@ -282,6 +282,150 @@ fn spawn_after_shutdown_is_cancelled() {
     assert!(other.block_on(task).unwrap_err().is_cancelled());
 }
 
+/// Sets its flag when dropped, to see that a local future was dropped rather than leaked.
+struct DropFlag(Arc<AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn spawn_local_runs_non_send_future() {
+    let rt = runtime();
+    let handle = rt.handle();
+    let timer = handle.timer();
+    let task = handle.spawn_local(move || async move {
+        // `Rc` is not `Send`; holding it across an await is what spawn_local allows.
+        let shared = std::rc::Rc::new(std::cell::Cell::new(20));
+        timer.sleep(Duration::from_millis(10)).await;
+        shared.set(shared.get() + 1);
+        shared.get() * 2
+    });
+    assert_eq!(rt.block_on(task).unwrap(), 42);
+}
+
+#[test]
+fn spawn_local_stays_on_one_thread() {
+    let rt = runtime();
+    let handle = rt.handle();
+    let timer = handle.timer();
+    let task = handle.spawn_local(move || {
+        let built_on = std::thread::current().id();
+        async move {
+            let first_poll = std::thread::current().id();
+            for _ in 0..3 {
+                timer.sleep(Duration::from_millis(5)).await;
+                assert_eq!(std::thread::current().id(), first_poll);
+            }
+            (built_on, first_poll)
+        }
+    });
+    let (built_on, polled_on) = rt.block_on(task).unwrap();
+    assert_eq!(built_on, polled_on);
+}
+
+#[test]
+fn spawn_local_from_inside_a_task() {
+    let rt = runtime();
+    let handle = rt.handle();
+    let inner = handle.clone();
+    let task = handle.spawn(async move {
+        let local = inner.spawn_local(|| {
+            let value = std::rc::Rc::new(7);
+            async move { *value }
+        });
+        local.await
+    });
+    assert_eq!(rt.block_on(task).unwrap().unwrap(), 7);
+}
+
+#[test]
+fn spawn_local_reports_panic() {
+    let rt = runtime();
+    let task = rt.handle().spawn_local(|| async { panic!("boom") });
+    assert!(rt.block_on(task).unwrap_err().is_panic());
+}
+
+#[test]
+fn spawn_local_abort_cancels_and_drops_future() {
+    let rt = runtime();
+    let handle = rt.handle();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let flag = dropped.clone();
+    let task = handle.spawn_local(move || async move {
+        let _guard = DropFlag(flag);
+        std::future::pending::<()>().await
+    });
+    rt.block_on(handle.timer().sleep(Duration::from_millis(20)));
+    GatotkacaJoinHandle::abort(&task);
+    assert!(rt.block_on(task).unwrap_err().is_cancelled());
+    // The pinned future is dropped on its own thread, a little after the abort.
+    rt.block_on(handle.timer().sleep(Duration::from_millis(100)));
+    assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn spawn_local_after_shutdown_is_cancelled() {
+    let rt = runtime();
+    let handle = rt.handle();
+    rt.shutdown(None);
+    let ran = Arc::new(AtomicBool::new(false));
+    let flag = ran.clone();
+    let task = handle.spawn_local(move || {
+        flag.store(true, Ordering::SeqCst);
+        async { 1 }
+    });
+    let other = tokio::runtime::Runtime::new().unwrap();
+    assert!(other.block_on(task).unwrap_err().is_cancelled());
+    assert!(!ran.load(Ordering::SeqCst));
+}
+
+#[test]
+fn shutdown_waits_for_local_tasks() {
+    let rt = runtime();
+    let handle = rt.handle();
+    let flushed = Arc::new(AtomicBool::new(false));
+    let seen = flushed.clone();
+    let token = handle.shutdown_token();
+    let timer = handle.timer();
+    handle.spawn_local(move || async move {
+        token.cancelled().await;
+        // Still flushing after the token fires; shutdown must wait for this.
+        timer.sleep(Duration::from_millis(50)).await;
+        seen.store(true, Ordering::SeqCst);
+    });
+    assert_eq!(rt.shutdown(Some(Duration::from_secs(5))), ShutdownResult::Clean);
+    assert!(flushed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn shutdown_aborts_stuck_local_tasks() {
+    let rt = runtime();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let flag = dropped.clone();
+    rt.handle().spawn_local(move || async move {
+        let _guard = DropFlag(flag);
+        std::future::pending::<()>().await
+    });
+    assert_eq!(rt.shutdown(Some(Duration::from_millis(50))), ShutdownResult::TimedOut);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !dropped.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(dropped.load(Ordering::SeqCst), "stuck local task was not aborted");
+}
+
+#[test]
+fn block_in_place_runs_inside_local_task() {
+    let rt = runtime();
+    let handle = rt.handle();
+    let inner = handle.clone();
+    let task = handle.spawn_local(move || async move { inner.block_in_place(|| 5) });
+    assert_eq!(rt.block_on(task).unwrap(), 5);
+}
+
 #[test]
 fn shutdown_token_child_does_not_cancel_runtime() {
     let rt = runtime();

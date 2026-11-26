@@ -73,7 +73,7 @@ rt::get().shutdown(Some(Duration::from_secs(10)));
 ## The execution model
 
 ```text
-install ──▶ block_on (host thread) ──▶ handle ──┬─ spawn / spawn_blocking / block_in_place
+install ──▶ block_on (host thread) ──▶ handle ──┬─ spawn / spawn_local / spawn_blocking / block_in_place
                                                 ├─ timer: sleep, timeout, interval, run_after, run_every
                                                 ├─ signals: listen, ctrl_c
                                                 ├─ readiness: register a raw fd / socket, then readable, writable, clear_*
@@ -143,7 +143,8 @@ these promises. Breaking them is undefined behaviour.
 
 - **Handles forward, never touch.** A handle used from another thread must not reach into thread-local executor state. It sends
   the request (spawn, timer registration, signal subscription) to the owning thread, for example over a channel, and that
-  thread does the work.
+  thread does the work. `spawn_local` takes a `Send` factory for this reason: the handle sends it to a core, which builds the
+  `!Send` future and keeps it.
 - **Poll where valid.** A future, timer, interval or listener tied to one thread's reactor must only be polled on that thread,
   or must be internally thread-safe. If it can end up polled elsewhere, it must not be marked `Send`.
 - **Wakers are thread-safe.** A `Waker` handed out must be safe to wake from any thread, as `std::task::Waker` requires.

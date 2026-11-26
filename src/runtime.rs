@@ -115,10 +115,27 @@ pub trait GatotkacaRuntimeHandle: Clone + Send + Sync + 'static {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static;
 
+    /// Spawns a future that is not `Send`, pinned to one thread for its whole life.
+    ///
+    /// `make` is `Send`: the handle forwards it to a thread of the implementation's choosing (a local worker, or a core of a
+    /// thread-per-core executor), and `make` runs there to build the future. The future is then polled and dropped only on that
+    /// thread, so it may hold `Rc`, `RefCell` and other thread-bound state. Only the output crosses back.
+    ///
+    /// Works from any thread, inside or outside the runtime. Everything else matches [`spawn`](Self::spawn): a panic in `make` or
+    /// the future becomes a join error, dropping the join handle detaches, `abort` cancels, and
+    /// [`shutdown`](OwnedRuntime::shutdown) waits for and then aborts local tasks like any other. After shutdown begins the join
+    /// handle resolves to a cancellation error and `make` never runs.
+    fn spawn_local<M, Fut>(&self, make: M) -> Self::JoinHandle<Fut::Output>
+    where
+        M: FnOnce() -> Fut + Send + 'static,
+        Fut: Future + 'static,
+        Fut::Output: Send + 'static;
+
     /// Runs blocking `work` inside a task without stalling the other tasks on this worker.
     ///
     /// Use it in place of [`OwnedRuntime::block_on`] when already inside the runtime. How the worker is freed is up to the
-    /// implementation; one that cannot free it may run `work` in place.
+    /// implementation; one that cannot free it, such as a [local](Self::spawn_local) worker, runs `work` in place. It must not
+    /// panic in either case.
     fn block_in_place<F, T>(&self, work: F) -> T
     where
         F: FnOnce() -> T;
@@ -138,7 +155,8 @@ pub trait GatotkacaRuntimeHandle: Clone + Send + Sync + 'static {
     fn shutdown_token(&self) -> Self::CancellationToken;
 }
 
-/// Control over a spawned task, from [`GatotkacaRuntimeHandle::spawn`] or [`GatotkacaRuntimeHandle::spawn_blocking`].
+/// Control over a spawned task, from [`GatotkacaRuntimeHandle::spawn`], [`GatotkacaRuntimeHandle::spawn_local`] or
+/// [`GatotkacaRuntimeHandle::spawn_blocking`].
 ///
 /// Dropping it detaches the task; it does not cancel it.
 pub trait GatotkacaJoinHandle: Send + 'static {

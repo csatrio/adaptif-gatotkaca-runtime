@@ -3,15 +3,15 @@
 use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use tokio::runtime::{Handle, Runtime};
+use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 use tokio::task::futures::TaskLocalFuture;
 use tokio::task::{JoinError, JoinHandle, LocalKey};
 use tokio::time::{Interval, MissedTickBehavior, Sleep, Timeout, error::Elapsed};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{LocalPoolHandle, TaskTracker};
 
 use crate::cancellation::GatotkacaCancellationToken;
 use crate::readiness::{GatotkacaReadiness, GatotkacaRegistration, RawSource};
@@ -25,6 +25,17 @@ struct Shared {
     closed: AtomicBool,
     shutdown: CancellationToken,
     tracker: TaskTracker,
+    /// Threads for `spawn_local`, started on first use.
+    local_pool: OnceLock<LocalPoolHandle>,
+}
+
+/// Aborts the pinned task when the tracked task that awaits it is aborted or dropped by shutdown.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// tokio shuts down by consuming its runtime, so the runtime sits in a lock that `shutdown` can take it out of.
@@ -38,7 +49,12 @@ impl OwnedRuntime for TokioRuntime {
 
     fn create() -> Self {
         let runtime = Runtime::new().expect("failed to build tokio runtime");
-        let shared = Shared { closed: AtomicBool::new(false), shutdown: CancellationToken::new(), tracker: TaskTracker::new() };
+        let shared = Shared {
+            closed: AtomicBool::new(false),
+            shutdown: CancellationToken::new(),
+            tracker: TaskTracker::new(),
+            local_pool: OnceLock::new(),
+        };
         let handle = TokioHandle { inner: runtime.handle().clone(), shared: Arc::new(shared) };
         Self { runtime: RwLock::new(Some(runtime)), handle }
     }
@@ -115,11 +131,42 @@ impl GatotkacaRuntimeHandle for TokioHandle {
         self.shared.tracker.spawn_blocking_on(work, &self.inner)
     }
 
+    fn spawn_local<M, Fut>(&self, make: M) -> JoinHandle<Fut::Output>
+    where
+        M: FnOnce() -> Fut + Send + 'static,
+        Fut: Future + 'static,
+        Fut::Output: Send + 'static,
+    {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return cancelled_task(&self.inner);
+        }
+        let pool = self.shared.local_pool.get_or_init(|| LocalPoolHandle::new(2));
+        // The pinned task runs on the pool's own runtime. A tracked task on this runtime awaits it, so shutdown waits for it,
+        // and aborting or dropping that task aborts the pinned one.
+        let mut pinned = AbortOnDrop(pool.spawn_pinned(make));
+        self.shared.tracker.spawn_on(
+            async move {
+                match (&mut pinned.0).await {
+                    Ok(output) => output,
+                    // Forwards the panic so the join handle reports it.
+                    Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                    // Only the tracked task aborts the pinned one, and then nothing is left to see this.
+                    Err(error) => panic!("local task cancelled outside the runtime: {error}"),
+                }
+            },
+            &self.inner,
+        )
+    }
+
     fn block_in_place<F, T>(&self, work: F) -> T
     where
         F: FnOnce() -> T,
     {
-        tokio::task::block_in_place(work)
+        // tokio can only free a multi-thread worker; on a current-thread or local runtime it would panic, so run in place.
+        match Handle::try_current() {
+            Ok(current) if current.runtime_flavor() != RuntimeFlavor::MultiThread => work(),
+            _ => tokio::task::block_in_place(work),
+        }
     }
 
     fn timer(&self) -> TokioHandle {
